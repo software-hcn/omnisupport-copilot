@@ -58,6 +58,10 @@ artifacts/
 data/generated/
 reports/capstone/
 
+# Lecture PDF scratch (regenerate with python pdf/tools/extract_text.py)
+pdf/_extracted/
+pdf/tools/inspect_report.json
+
 # Docker
 .docker/
 

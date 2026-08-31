@@ -434,6 +434,18 @@ $DEVBOX pytest tests/contract/test_week11_eval_contracts.py \
 - 从 golden set 删掉全部 `multi_hop`，确认 loader 报 `missing=...`。没有四类覆盖的评测集，契约测试必须挡住。
 - 把校准集里几条 `judge_score` 改乱，确认 `trust_level=low` 且 CLI 退出码为 1。改 prompt 等于换裁判，这条路径就是在演「校准失败不许发布」。
 
+### 动手清单参考答案
+
+先自己答完上面的验收问题和加分练习，再往下对。
+
+1. 锁的是 `evals/sets/rag_qa_golden_v2_3_0.jsonl` 这一份。报告 / manifest 里应有 `eval_dataset` 的 `id` / `version` / `digest`（文件字节 `sha256:`）三件套；缺 digest，「上线前 vs 上线后」没法比。课堂 8 条只用来把契约和门禁跑通，不是生产规模。
+2. 6 指标要分层看，不要只看总分：检索层 `context_precision` / `context_recall`，生成层 `faithfulness` / `answer_relevance`，整体 `answer_correctness` / `semantic_similarity`。CP 和 CR 必须拆开——只跑 CP 会自我感动。课堂 runner **不是真 RAGAS**：离线读 `--predictions` fixture，用确定性词面代理算出同一份 report shape，Docker 里不依赖付费 LLM。
+3. 看 `gate.status` 和 `blocking_reasons`。Runner 自己的闸是 `pass_rate < 0.80`、任意一条 adversarial 没过、任意一条 safety 失败 → fail。这和 `check_regression` 相对 baseline 的闸是两道，不要混成一道。
+4. 校准报告 κ 必须 ≥ 0.6 才是 `trust_level=high`，才能写进 manifest 做生产决策。课堂校准集 8 条、纯 Python 读现成 `human_score` / `judge_score`，不在线打分。κ < 0.6 就是 `low`，CLI 应非 0 退出。
+5. `pii_leak_rate` 的 target 是 `"=0"`，必须 pass。这一条 fail **不能放行**——合规是二值红线，不是和 faithfulness 混在一个看板里「尽量低」。质量可以边上线边优化，PII=0 必须 100% 达标才准 GA。
+
+加分练习：预测里塞 `13800138000` → `safety_pass=false` 且 runner gate fail，平均 faithfulness 再高也过不了。`faithfulness` 减 0.05 会撞 `--max-drop 0.02`；`safety_pass_rate` 从 1.0 改 0.99 会撞 `--no-drop`——质量允许微晃，安全红线一丝不能退。删光 `multi_hop`，loader 报缺类（四类 `happy` / `boundary` / `adversarial` / `multi_hop` 必须都在）。改乱 `judge_score` → `trust_level=low` 且退出码 1，演的是「改 prompt = 换裁判，校准失败不许发布」。
+
 ---
 
 ## 9. 易错点与边界
@@ -477,6 +489,23 @@ Week11 交付的是**质量控制面的课堂闭环**：JSONL golden set 契约�
 10. A/B 跑了 30 条，B 的 faithfulness 高 3 个点。为什么还不能 `ship_B`？要检测 5% 效应大概需要多少样本？双重检验少跑 Mann-Whitney 会怎样？
 11. Faithfulness 从 0.85 涨到 0.92，一次解决率却不动。漏斗上你先查 Quality、Behavior 还是 Workflow？举一个具体卡住的例子。
 12. `pii_leak_rate` 当前是 0.001，其余业务 SLO 全绿。按本周红线能不能 GA？风控模型 AUC=0.88 但 PSI>0.25，你上线前还是上线后该做什么？
+
+### 自测题参考答案
+
+先自己答完上面的题，再往下对。
+
+1. 「抽测几个 case 感觉还行」没有版本、不能回归、不能阻断、交不出给监管看的数字，2026 年签不了上线。评测集比测试用例多出的四个工程属性是：**可版本、可回归、可对抗、可治理**（再加可重放）。评测集烂，后面 metrics / judge / gate 全是空中楼阁。
+2. 不合格。反例 8/200 = 4%，讲义口径是反例低于 10% 就只测了晴天。上线后最可能在 adversarial / 安全合规事故上翻车——红队和历史事故那一类。四类样本 `happy` / `boundary` / `adversarial` / `multi_hop` 少一类就有一整块盲区。
+3. 半自动只能出草稿；反例和边界机器编不出真实感，编出来的是「看起来像攻击」的假题。必须手工补 10–20 条 adversarial（历史事故 + 红队），这是价值最高、90% 团队没有的部分。
+4. 召回很干净但漏了一半关键资料：答得像那么回事，关键条款/例外没出现。CP 低才改 rerank / 阈值；CR 低该改 chunk 策略 / hybrid（Week07/08），不是先调精排。
+5. 先修生成层的 **answer_relevance**（Query 改写 / Multi-Query），不要先庆祝。金融里 faithfulness 是第一红线，0.93 说明没在编；AR=0.70 是答非所问，用户一眼看穿。F 比 AR 更重要，不等于 AR 可以烂着上线。
+6. 今天 4 分明天 3 分是分数无锚点（Single Score 飘 ±1），用 4 档锚点 + calibration example。长答案系统性偏高是**长度偏差**，prompt 显式声明长度不计分。GPT 给 GPT 打高分是**自我偏好**，永远 cross-evaluate。另有位置偏差（换序取平均）和拒绝偏差（定义不确定的扣分规则）。换更强模型消不掉。
+7. κ < 0.6 表示排除随机后与人类都不一致，这个 0.9 分和算命没区别，不能做上线决策（仓库 `trust_level=low`）。改了 `faithfulness.j2` 一句「长度不计分」= 换裁判，必须重跑校准（κ / Pearson / MAE / Top-K），prompt 改几个字和人类一致性可以差 30%。
+8. 卡在 L1（周报）或 L2（PR 跑但不阻断）——看着有评测，其实没牙。升到 L3 最小动作就是退化超阈值 `exit 1` 不能合并。不阻断的评测等于没有评测。
+9. **不应该合并。** `--max-drop` 过只说明平均质量微晃在允许范围内；`--no-drop safety_pass_rate` 失败就是安全红线退了。平均质量更好不能当例外——这就是门禁有牙齿的地方。
+10. 不能 `ship_B`：效应约 3%、样本 30，远低于检测 5% 效应所需的约 **200** 条（≥10% 才 80 条）。决策只有 `ship_B` / `keep_A` / `need_more_data`。少跑 Mann-Whitney：RAG 分数常非正态，单一 t-test 会骗人；必须 t-test + Mann-Whitney 双重 p < 0.05。
+11. 漏斗是 Tech → Quality → Behavior → Workflow → Business。F 涨了一次解决率不动，先查 **Quality**（用户是否理解），再 Behavior（是否还追问），再 Workflow（工单是否关闭）。例子：答案质量上去了，UI 把引用折成用户看不懂的卡片，工单照样没关。
+12. **不能 GA。** `pii_leak_rate=0.001` 不是 `=0`，合规红线是二值，其余 SLO 全绿也是监管事件。AUC=0.88 是上线前「模型好不好」（已过 >0.75 可用）；PSI>0.25 是上线后「模型坏没坏」——分布已漂，该重训，不是继续吃 AUC 的老本。
 
 ---
 

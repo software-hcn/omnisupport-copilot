@@ -445,6 +445,19 @@ docker compose --profile tools --env-file infra/env/.env.local -f infra/docker-c
 
 Dagster 的 `week13_graphrag` group 只看编排和报告；真写入用第 4 步 CLI。
 
+### 动手清单参考答案
+
+先自己答完上面的验收问题和加分练习，再往下对。
+
+1. 通过的构图报告应是 `status=pass`（`entities` / `edges` 都非空，且 `quarantined`、`rejected` 都为空），每条边的 `evidence_ids` 必须非空——`quality_gate.require_evidence_for_edges` 和 SQL `CHECK (cardinality(evidence_ids) > 0)` 都会挡住无证据边。`Workspace` 与 `Northstar Workspace` 在 schema 里是同一 `PRODUCT` 的别名，契约测试会断言它们合并成一个节点；没合并就是对齐失败，后面的路径会碎。
+2. persist 之后该 `graph_release` 应为 `active`，并绑上命令里的 `index_release_id=index-week08-dev`；一个 graph release 只消费恰好一个 `data_release_id`。图是 Week07 silver chunks 上长出来的派生层，上游换版就出新的 graph release，禁止原地改图。
+3. 成功的多跳响应里 `retrieval_mode` 应是 `graph_multihop`，`citations` 与 `graph_debug.paths` 非空，`fallback_reason` 为 null。没配外部 LLM 时可以返回证据摘要，但路径和 citation 必须是已持久化的真证据，不能编。
+4. 「怎么重置密码」走 `auto` 必须仍落在 `hybrid`。GraphRAG 是补位不是更好的 RAG：FAQ / 定义是向量主场，开了 Week13 也不许把 FAQ 送进图——分类器碰到 FAQ / 「是什么」信号直接 hybrid。
+5. A/B 的 `routing_policy` 必须按 `factual / local / global / multi_hop` 分别给决策，不是一个全局开关。`Δquality ≥ 0.08` 且 `cost_ratio ≤ 5.0` 才给该类开图，但 `factual` 即使图质量更高也仍标 `hybrid`。课程 fixture 只验门禁形状，不能当生产上线证据。
+6. 无图证据、release 非 `active`、运行时异常时，`/rag/answer` 降级 `hybrid` 并在 `graph_debug.fallback_reason` 留下原因，而不是 500 或编造 citation。默认检索模式始终是 `hybrid`。
+
+加分练习：在 schema 里加未声明关系，构建应 `rejected` 且边列表仍为空——schema-first 禁止 LLM 自创类型，未知关系构建期就 reject。把 `Workspace` 别名删掉再构图，会出现两个 PRODUCT 节点，这就是对齐失败如何把图切碎。用同一个 `graph-week13-dev-v1` 改输入再 `--persist`，会被不可变 release 挡住（`already exists with different content`），必须换新 ID，不能原地覆盖。
+
 ---
 
 ## 9. 易错点与边界
@@ -491,6 +504,23 @@ Student Core 的 PostgreSQL 图是「课堂能跑、契约能守」的基线，�
 10. 只返回图路径、不带 `evidence_ids`，在合规上错在哪？双链分别守什么？
 11. 总体 faithfulness +0.02、成本 ×5，能不能全量开 GraphRAG？即使图质量更高，`factual` 的 routing_policy 为什么仍写死 `hybrid`？
 12. 图 release 已经 active，上游 chunk 改了一段原文。旧的 graph citation 会不会跟着变？哪个表挡住了这件事？
+
+### 自测题参考答案
+
+先自己答完上面的题，再往下对。
+
+1. 先问上图前的 5 件事：归纳/多跳题型占比是否 > 20%、文档规模是否 > 1k、实体间是否真有结构密度、主场题型 QPS 是否 > 0.1、Week06–12 底子齐不齐。GraphRAG 是补位不是更好的 RAG，「答不准就上图」是工程债。5 项全过才上；只过 3 项做 PoC、跑按题型 A/B；不到 3 项别上。
+2. 向量假设是「答案藏在语义相近的某几个 chunk 里」。「怎么重置密码」答案就在 1–2 个 chunk，必须走 hybrid；「过去半年 P0 共性」散在 100+ 文档、答案在关系里，向量必败，走 `graph_global`。FAQ 上图只会拖慢、加噪、加钱，质量不涨。
+3. 图必须建成 Week06/07 的派生资产：一个 `graph_release` 只消费恰好一个 `data_release_id`，citation 冻在该 release 上。另起抽取服务会把契约、血缘、证据锚点、release 版本绑定四样一起切断——另选图库、另起服务同样如此。回滚是切 `GRAPH_RELEASE_ID` 或把路由切回 hybrid，不是删表。
+4. schema-first 焊死的是类型 allowlist：节点 5–20 种、关系 10–30 种，禁止 LLM 自创类型，禁止 `related_to` 这种含糊动词。仓库里未知关系构建期直接 reject / quarantine，不入库；宁可漏抽，不要错抽。Student Core 抽取只接受已审查 annotations，不是让模型自由抽。
+5. 二者在 schema 里是同一 `PRODUCT` 的别名，必须并成一个节点。对齐失败会把同一实体切成多个节点，多跳路径在「问题 → 症状 → 方案」中间断开，召回看起来有边、推理走不通。
+6. 模糊分 0.90：自动合并线是 0.96，送审线是 0.88。0.90 落在模糊带但够不上 unique_fuzzy，仓库送 **quarantine 隔离**，不强制合并，更不交给 LLM 判断。图废掉的最快方式就是把两个不同实体合成一个——这是 ADR-0013 的硬决策；仓库没有 embedding / LLM 对齐漏斗。
+7. Local 解「一个问题及其直接症状/方案」，种子实体 **1 hop**；Global 解跨文档共性/分布，查预计算社区摘要；Multi-hop 解显式关系链，有界递归 **最多 3 hop**；DRIFT 是 local 路径 ∪ global 社区的一次查询，不是第三种独立图。Local 是已知锚点的直接邻居，1 hop 足够；多跳才需要有界遍历，再长会撑爆上下文、LLM 失焦。
+8. 分类器阈值 0.70，吃不准必须回 hybrid。低置信时「试试图也好」会把 FAQ 拖进贵路径，加噪加钱还可能 500。无图证据 / release 非 active / 运行时异常同样降级 hybrid，并记下 `fallback_reason`，默认模式始终是 hybrid。
+9. LLM 不会读 `{src, edge, tgt}` JSON，召回再准生成也会稀烂。口令：能用文本就别用 JSON。路径 → 句子服务 Multi-hop；子图 → 结构文本服务 Local；社区 → 摘要块服务 Global。仓库硬截断 6000 字符，citation 只从已持久化 evidence 组装。
+10. 图给线索（结构），原文给凭证（可引用）。合规上证据永远比线索重要：只返回路径、不带 `evidence_ids` / chunk citation，客户问「凭什么」答不上，审计也站不住。双链分别守：chunk 链（`citations` / `evidence_ids`）和 图链（`retrieval_mode` + `graph_debug.paths` / communities），外加 `trace_id` / `release_id` / `graph_release_id`。
+11. 不能全量开。总体 faithfulness +0.02、成本 ×5 会骗人：简单题图可能更差，归纳题图好一大截，一平均略涨。真正该算的是主场题型收益 × 占比 − 额外成本，> 0 才上，而且必须按题型 A/B。`factual` 的 routing_policy 写死 `hybrid`，是「FAQ 不要上图」在评测层的落实——即使图质量更高也不改。
+12. 旧的 graph citation **不会**跟着变。`graph_evidence_projection` 把 `page_no` / `section_path` / `bbox` / `doc_version` 按该 graph release 冻结，防止后来 chunk 更新把旧图证据悄悄改写。上游换版应出新的 graph release，禁止原地改图。
 
 ---
 

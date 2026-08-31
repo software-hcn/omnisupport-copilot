@@ -456,6 +456,18 @@ docker compose --env-file infra/env/.env.local -f infra/docker-compose.yml up -d
 - 把 `WEEK06_DEFAULT_PARTITION` 改成种子里没有的日期，看 `partition_completeness` 从 `passed` 变 `warning`，然后解释为什么 `downstream_decision` 仍然是 `dry_run_only`。
 - 按讲义 L02 的复合分区思路，把 `partitions.py` 改成 `MultiPartitionsDefinition({"date": ..., "tenant": ...})`，看会连带改动 `assets.py` 哪几处、schema 的 `partition_key` 正则会不会失效——这最能体会"分区键一旦定下不要原地改"。
 
+### 动手清单参考答案
+
+先自己答完上面的验收问题和加分练习，再往下对。
+
+1. 主链：`seed_manifests` → `manifest_gate` → `raw_ticket_events_partitioned` → `ticket_fact_partitioned` → `run_evidence_report` → `data_factory_delivery_summary`。三条旁路同样汇入 evidence：`lakehouse_state`、`support_kpi_mart`、`backfill_plan`。`backfill_plan` 必须是上游：evidence 要记录「这一格怎么补」（范围 / 资源 / 影响 / 策略 / 回滚），补数评估单是输入不是事后附录。
+2. `2026-04-17` 是因为种子 JSONL 的 `created_at` 落在这一天。换成 `2026-03-01`，`partition_completeness` 变成 `warning`（`partition_has_no_seed_rows`）。五个 check 里只有它失败时走 warning，其余直接 failed。
+3. 真正读种子 JSONL 的是 `duplicate_idempotency`、`required_field_null_rate`、`partition_completeness`。`manifest_consistency` 读 manifest，`row_count_output_count` 读 ingest_stats。Dagster UI 上空跑的是 `row_count_output_count`：包装直接 `skipped`（`requires_materialization_context`），真检查只在 `run_week06_asset_checks()` 被 evidence 调用时才跑。
+4. 默认课堂是 `dry_run_only`。`build_downstream_decision()` 里 `dry_run` 排在 `warning` 之前，`WEEK06_INGEST_DRY_RUN` 默认 `true`，所以永远到不了 `proceed_to_week07`。要变成它：设 `WEEK06_INGEST_DRY_RUN=false`，且 status 不是 failed / warning。
+5. 没跑过 Week04 / Week05 时，`lakehouse_snapshot_id` / `dbt_invocation_id` 是 `not_available` reason code，不是假 snapshot。文件不存在就显式缺失，下游不会误以为 Lakehouse / dbt 已经物化过——伪造 passed 比缺证据更危险。
+
+加分练习：插重复 `ticket_id` 打通的是 L03 写入层幂等，check `failed` → evidence `failed` → `hold_downstream`。改 `WEEK06_DEFAULT_PARTITION` 到空日期只让 `partition_completeness` 变 warning，但 dry_run 仍优先，所以 `downstream_decision` 还是 `dry_run_only`。改成 `MultiPartitionsDefinition` 会连带 `assets.py` 取键、`backfill_plan` 展开窗口、evidence schema 的 `partition_key` 正则——这就是「分区键一旦定下不要原地改」。
+
 ---
 
 ## 9. 易错点与边界
@@ -497,6 +509,23 @@ runbook 的 Known Limitations 把刻意不做的写得很清楚：不引入 Dags
 10. 字段级血缘在哪四类 SQL 结构上会断链？为什么说 90% 自动 + 10% 手工补就是最佳实践？
 11. 一份 Runbook 缺了 R4 Verification 会怎样？为什么"没人测试"这个反模式必须靠 Game Day 而不是靠 review 解决？
 12. 本仓库的 `downstream_decision` 为什么在默认课堂模式下永远拿不到 `manual_review_required`？要改哪里？
+
+### 自测题参考答案
+
+先自己答完上面的题，再往下对。
+
+1. Task 服务不了「我要拿到第 42 版的 silver」。Airflow DAG 全绿，下游仍问不出 `customer_dim` 是哪一版、哪个 snapshot——能跑通任务，交付不了可寻址资产。
+2. **Ownership** 最容易被「我们也用了 Dagster」糊弄：框架自带 UI / Asset Graph，看起来像可观测、可寻址，但告警仍可能 @everyone，本仓库 tags 甚至没有 `owners` / FreshnessPolicy。没有 team-level owner，可责任这条就是空的。
+3. 分区首要是时间/维度上的可寻址，性能只是副产品。只当查询加速：事故补数只能整表或整月重跑，不能只重跑 `2026-05-15` 那一格，影响范围算不清、成本爆炸。
+4. wall-clock 是处理时间。5 月 18 日的数据 5 月 22 日才到，会记到到达日而不是事件日。必须用 `event_time` + watermark，迟到数据才归回它原本所属的分区。
+5. 原地给老分区加维度，会让所有下游重建分区元数据，老格子的身份变了。合法路径是新建 `MultiPartitionsDefinition`，老数据全归 `default` tenant，老分区一行不动。
+6. 「再跑一次」用的是今天的代码 + 今天的上游，等于用今天的逻辑改写两周前的事实。`source_snapshot_at` 告诉系统按那个历史时刻的上游 snapshot 做时间旅行。
+7. 写入层 MERGE/UPSERT 多数团队会做；99% 事故在另外两层。副作用：同一封「账单已修复」邮件发 7 次。下游：没发 Watermark Event，RAG 索引还在用旧 chunk。
+8. `uuid_v4()` 只适合 append-only 事件流。当业务主键则每次重跑 ID 都不同，完全不幂等。确定性合成主键 `hash(partition_key + business_key + version)` 的代价是实现稍复杂，改 schema 时 hash 必须版本化。
+9. 「血缘文档」靠人维护，代码一变就撒谎。运行时血缘是 Job / Run / Dataset / Facet 事件流，跑一次发一次，机器产生所以不会过期。
+10. 断链四处：Window function、UDF、JSON/半结构化、跨引擎。字段级不可能 100% 自动解析，90% 自动 + 10% 关键域手工补是当前最佳实践。
+11. 缺 R4 就是「修了等于没修」——没有验证命令和期望输出。review 看不出命令是否过期；Game Day 才让人在压力下真跑一遍，卡住的地方就是 Runbook 的 bug。
+12. `dry_run` 的判断排在 `warning` 之前，默认 `WEEK06_INGEST_DRY_RUN=true`，warning 分支永远进不去，只能拿到 `dry_run_only`。要看到 `manual_review_required`，必须显式设该环境变量为 `false`，且 status 为 warning。
 
 ---
 

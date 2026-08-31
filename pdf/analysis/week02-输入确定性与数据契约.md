@@ -356,6 +356,19 @@ docker compose --profile tools --env-file infra/env/.env.local \
 - 故意改坏一个 `enum` 或 `required` 字段，确认 contract test 会失败，然后判断这是 additive / conditional / breaking 中的哪一类
 - 在 `sample_records.json` 里加一条 negative case（比如 document 只有 text 没有 locator），确认它被正确拦截——**没有 negative case 的 contract test，只能证明"样例能跑"，证明不了"系统能守门"**
 
+### 动手清单参考答案
+
+先自己答完上面的验收问题和加分练习，再往下对。
+
+1. `--manifest-dir data/seed_manifests` 会跳过 schema 文件，读入三份基线（`manifest_tickets_synthetic_v1.json` / `manifest_edge_gateway_pdf_v1.json` / `manifest_workspace_helpcenter_v1.json`）和练习份 `manifest_week02_practice_v1.json`；同目录的 `manifest_week07_multimodal_v1.json` 也会被扫到。基线三份是 `full_snapshot`，批次边界靠 `batch_id`（如 `batch-20260331-001`）；练习份是 `incremental_cursor`，`selection_window` 声明了 `cursor_field=updated_at` 和起止窗口，批次边界更明确。
+2. 工单绑 `omni://contracts/data/ticket/v1`，文档绑 `omni://contracts/data/doc_asset/v1`。闭环来自两处：`source_manifest_schema.json` 把 `contract_ref` 做成四值 enum，`seed_loader.py` 的 `CONTRACT_REGISTRY` 再按 modality / asset_type 校验——manifest 绑不到一份不存在的契约。
+3. 三份基线 checksum / metadata / PII 字段齐，默认策略下应 **accept**。练习份故意分流：`practice_ok` accept；`practice_warn` 缺 checksum 且 metadata=partial → **warn**（`on_missing_checksum` / `on_partial_metadata`）；`practice_quarantine` 开了 pii_scan 但 `pii_scan_status=not_run` → **quarantine**（`on_pii_gap`）。契约不匹配或 `license_tag=unknown` 才 **reject**。多条原因取最严：`accept < warn < quarantine < reject`。
+4. 每份 manifest 有 `owner=course-team`，每个 asset 有 `source_id`；报告里有 `run_id`（`seed-loader::{batch_id}`）和 `batch_id`。现有 JSON **没有** `release_id` 字段，`seed_loader` 报告也不写它。Week03 能接上的是 `manifest_id` / `batch_id` / `source_id` / `owner` / gate 动作；缺 `release_id` 时评测和发布很难钉死「哪一版输入」。
+
+加分练习：
+- 改坏 `enum` 或把字段改成 `required`：契约测试应失败。删字段 / 收紧 required / 语义漂是 **breaking**；只加可选字段是 **additive**；扩 `status` 枚举（讲义的 `in_progress`）是 **conditional**。看到失败说明门禁在工作，不要为了过测试放宽 enum。
+- 给 document 加一条只有 text、没有 `page_no` / `section_path` / `bbox` 的 negative fixture：应按证据层不过。这只说明「没有 locator 的样例守不住 citation」，不是让你改生产数据。
+
 ---
 
 ## 9. 易错点与边界
@@ -390,6 +403,21 @@ Week03 的 state、watermark、idempotency 不是凭空长出来的，它们直�
 8. 五种 load_mode 中，replay 和 backfill 的本质区别是什么？各自最大的风险是什么？
 9. 什么情况该 quarantine 而不是 reject？两者对下游的处理路径有什么不同？
 10. 一次 dry-run 跑完，run evidence 里必须留下哪五组信息？少了 `release_id` 会导致什么问题？
+
+### 自测题参考答案
+
+先自己答完上面的题，再往下对。
+
+1. 例：服务没挂、`status` 仍是 string，但生命周期语义漂了，KPI 和 tool route 一起偏——**事实底线**。chunk 还能召回，但 `page_no` / `bbox` 丢了、citation 断了——**证据底线**。检索没按 `tenant` / `role` 过滤导致越权——**边界底线**。共性是系统还在跑，并且高自信地错。
+2. 「工单相关回答系统性忽高忽低」先查输入层：schema、枚举、时间窗、增量窗口。只有少数问法出错才看 prompt / retrieval。先调 prompt 是修症状：根因多半是事实底线漂了。
+3. Source system 是资源目录（本仓库 manifest 里的 MinIO / seed JSONL 路径）；Input asset 是能以什么资格进系统（`ticket_event` / `doc_asset`）；Serving object 是运行时消费对象（retrieval chunk / 后续 KPI mart / tool input）。判断口令：字段既像源又像运行时，先停下来问它属于哪一层。
+4. 正确顺序是 `raw asset → shared core → modality extension → chunk/segment → gate`。先 chunk 再补 metadata，命中后才发现没有页码、章节、坐标、权限——citation 和策略一起断。
+5. `true/false` 回答不了系统要做什么。六个动作：`store_raw` / `embed` / `retrieve` / `display` / `pass_to_tool` / `human_review`。默认：sensitive 优先脱敏后消费，restricted 不进通用 serving。
+6. Schema 看长相（字段形状），Contract 看资格（shape + semantics + evidence + policy + quality）。五层分别守结构、语义漂移、引用追责、越权/PII、新鲜度与放行。
+7. 结构没坏，所以不是 breaking；但新枚举会穿透统计和 tool route，下游 KPI / 路由 / UI 必须 review，所以是 **conditional**。additive 只适用于新增可选字段、通常放行并记录。
+8. replay 重跑**旧批次**（不是新数据），最大风险是重复写入、版本混淆；backfill 补**历史空洞**（不是在线变化），最大风险是影响范围过大、资源争抢。
+9. 个别记录坏、整批还有可用部分 → `quarantine`（隔离，后续 patch / replay）；manifest 严重错误、contract 不匹配、关键字段缺失 → `reject`（整批不接，先修准入）。quarantine 可观察可补；reject 不能进主链路。
+10. 五组：identity（`run_id` / `release_id` / `manifest_version` / `git_sha`）、source linkage、gate result（四类动作 + `reason_code`）、window state、next action。少了 `release_id`，后面无法把一次运行钉到可发布的数据版本上，复盘只能猜。
 
 ---
 

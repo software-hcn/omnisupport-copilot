@@ -399,6 +399,18 @@ $DEVBOX python skills/rag-contract-check/scripts/check_response.py \
 - 把 `description` 改成 `"helps with data"`，先手算 Stage 1 会不会误激活，再跑 `SkillRegistry.search("rag citations")` 看路由是否塌
 - 对照讲义的 ODCS `lint.py` 和仓库占位 `lint.py`，列一张「生产级还缺哪四条」——这正好是 L02 脚本四要点的自测
 
+### 动手清单参考答案
+
+先自己答完上面的验收问题和加分练习，再往下对。
+
+1. `GET /api/v1/skills` **不返回 `body`**（集成测试钉死）；`count` 是 **5**，对应五个 Pack：`data-contract-lint` / `ingest-backfill-runbook` / `rag-contract-check` / `prompt-release` / `release-check`。`progressive_disclosure` 三段：Stage 1 → `discover()` / `list_skills` 只给 frontmatter；Stage 2 → `get_skill()` 才读一篇 `SKILL.md` 正文；Stage 3 只**列出** scripts / references / assets 路径，本周不远程执行。三段对应的是这两个函数 + 路径列举。
+2. `GET /api/v1/skills/rag-contract-check` 多出来的三类路径，应对得上磁盘 `skills/rag-contract-check/scripts/`、`references/`、`assets/` 里的真实文件（脚本名是 `check_response.py`，不是讲义的 `check.py`）。
+3. OpenAI 导出叫 `activate_skill_*`，因为这是 **activation descriptor**（参数只有 `task` + `context_summary`），不是业务 Tool。改工单仍走 Week10 的 `ticket.update`。MCP `readOnlyHint: true`（配 `destructiveHint: false` / `idempotentHint: true`）守的是：本周只发现、不执行破坏性动作。
+4. 示例里 `skill_release_id` 锁 `skills-v0.1.0`；`skills[0]` 锁 `rag-contract-check@0.1.0`，`digest` 是占位 64 个 `0`。代码里 `SkillMeta.digest` 是整份 **`SKILL.md` 文本的 sha256**（frontmatter + body），**只哈希 SKILL.md，不哈希脚本树**。示例占位 0 与运行时 hash **不是同一套数值**，算法口径才要对齐。
+5. 五个 `not_for`：lint 不管无契约语义的 JSON 格式化 / 跑迁移；backfill 不管无 manifest 的 ad hoc SQL / 破坏性删数；rag-check 不管无契约字段的文笔评审 / 不验 schema 的 prompt 改写；prompt-release 不管一次性 brainstorm / 绕过 RAG 契约的改动；release-check 不管无发布意图的本地草稿 / 未经审批的紧急回滚。`requires`：`prompt-release` → `rag-contract-check` 闭环；`release-check` → lint + rag-check + prompt-release；`ingest-backfill-runbook` 与 `rag-contract-check` 都依赖 `data-contract-lint`。注意 lint Pack 的 `requires` 写的是库名 `jsonschema`，不是 Skill 名。
+
+加分练习：删 `not_for` 是测试附加断言失败（schema 并不 required 它）；`name` 与文件夹不一致则 schema + 测试一起挂。`description` 改成 `"helps with data"` 会在 Stage 1 误激活；`search("rag citations")` 是 AND 词项，改坏 description 后路由会塌。对照占位 `lint.py`，生产级还缺 L02 四条：幂等可重入、真正的结构化校验、明确错误码、零隐式依赖。
+
 ---
 
 ## 9. 易错点与边界
@@ -440,6 +452,23 @@ Week10 要接的不是「再写几个 Pack」，而是：Function Calling / Tool
 10. OpenAI 导出为什么参数只有 `task` 和 `context_summary`？如果 Agent 直接拿 Skill 去改工单，缺的是 Week09 的哪一层，还是 Week10 的哪一层？
 11. 讲义的 YAML Release Manifest 和仓库的 JSON `skill_release_id` 是不是同一份工件？事故回滚时你切的是 Skill 文件夹还是 `release_id`？
 12. 什么情况下该把「LLM 直选」换成 embedding 路由？本周五个 Pack 为什么还不必上？
+
+### 自测题参考答案
+
+先自己答完上面的题，再往下对。
+
+1. 补数靠「找老 X」：人走流程消失。破坏的是可复现（没有分区锁和 snapshot）和可审计。堆到 Confluence 会停更，Agent 读不到、也不能执行，跨工具更搬不走。
+2. Tool 解决「调一个函数」；Prompt 解决「约束单次输出」；MCP 解决「连上世界」；Skill 解决「连上之后怎么干漂亮」。Skill 是容器，内部可以指向 Tool / Prompt / MCP，不是替代品。
+3. 官方强制 `name` + `description`。仓库 schema 再强制 `version`。测试额外检查 `not_for` 非空、`outputs` 非空（以及文件夹名 == `name`）。课堂把 `version` 做成 required，是为了能锁进 `skill_release_id`，否则 Pack 改了对不上发布。
+4. 「读它来理解」放 `references/`，「拿它来生成」放 `assets/`。正反例塞进 `SKILL.md` 正文会把 **Stage 2 Activation** 撑爆。
+5. 50 个 × 2K token ≈ 10 万；只加载 frontmatter 约 50 × 100 token，启动成本近似常数。`GET /api/v1/skills` **不返回 `body`**，是守 Discovery 只读 frontmatter——列表带 body 就是全量加载。
+6. `description` 是 Stage 1 Agent **唯一能看到的东西**，必须含做什么 + Use when。坏例子：`helps with data`——太泛、没有触发词、会误激活所有数据问题（违反「动词具体 / 边界清晰 / 带反例」）。
+7. Wiki 边界写「通常不要…」，失败是出错再说；`SKILL.md` 写「禁止 X / Y / Z」，并事先声明 failure mode。「建议不要删除」会被 Agent 打折扣，禁令才是硬约束。
+8. 只写何时用，`rag-contract-check` 最可能抢走「模型答得准吗」（评测）或 `prompt-release` 的活。仓库对应字段是 frontmatter 的 `not_for`，不是正文 `## NOT-TRIGGER`。
+9. `digest` **只哈希整份 `SKILL.md`**（frontmatter + body）。改一句 Safety Boundaries，hash 变、release 对不上；改 `scripts/lint.py` 却可能对得上。覆盖手册文本，没覆盖 scripts / references / assets。
+10. 导出参数只有 `task` + `context_summary`，因为这是激活描述符，不是 `ticket.update`。Agent 直接拿 Skill 改工单，缺的是 **Week10** 的 Tool Contract / 权限 / HITL，不是 Week09 再写一个 Pack。
+11. 不是同一份工件。讲义 YAML（`kind: RAGRelease`）不是本周运行时格式；仓库 Week09 走 JSON v1 的 `skill_release_id`。事故回滚切的是 `release_id` 指针，不要去改 Skill 文件夹碰运气。
+12. Skill ≥ 50 再上 embedding 路由；< 30 用 LLM 直选。本周只有 **五个 Pack**，词项全匹配预过滤够用，不必上。
 
 ---
 

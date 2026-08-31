@@ -392,6 +392,18 @@ Podman 用户把 `docker compose` 换成 `podman compose`，代码路径相同�
 - 把 rollback 目标改成非直接前一版，确认 `direct previous release` 拒绝
 - 观测 JSON 里写一个别人的 `release_id`，确认 canary 失败关闭而不是改绑
 
+### 动手清单参考答案
+
+先自己答完上面的验收问题和加分练习，再往下对。
+
+1. `release_id` 形如 `omni-dev-v日期-序号`，环境写进 ID（`omni-{env}`），不要手写 UUID。六个组件 data / index / prompt / model / skills / graph 都必须有 `artifact_digests`——一个 `release_id` 绑死这 6 类，少一类就留半发布窗口。本仓库没有 lakeFS 集群，只有 `data/lakefs/config.yaml` 策略，加上 `release_environment_pointer` 这一行指针；生成器算出的是不可变 manifest，真正「发布」是改指针。
+2. 不传 `--previous` 时旧组件视为空，六个都会被标成 changed。课堂第一次生成可以跑；真晋升必须传上一份，否则爆炸半径被高估、审批角色被误触发，影响分析失去「改了什么」的差分意义。
+3. 红线优先于质量变好。`canary_red_line_breach.json` 里 correctness 从 0.83 升到 0.92，仍因 `pii_leak_rate: 0.01` 决策 `rollback`。缺 `pii_leak_rate` 不能当成 0，代码视为 `missing_red_line_metric`，同样直接 rollback——观测不完整视为不安全。
+4. rollback 只切**直接前一版**指针，不删 release 证据。第二次 promote 后再 rollback：active 回到第一版，`generation` 变成 3（每次指针切换 +1）。审计事件用 `previous_event_digest` 拉链，应首尾相接；UPDATE/DELETE 触发器直接拒绝。
+5. 合规生成器缺证据就 fail，绝不编。输出写明 Missing evidence is never synthesized。把 impact 文件拿掉，`completeness.status = fail`，进程退出码 2。prod 必须凑齐 impact + eval + rollout。
+
+加分练习：改 manifest 任意字段再 `verify_manifest`，应 digest mismatch——完整性签的是去掉 `integrity` 之后的 canonical JSON。对 prod 只记录 5% 就 promote，应被 `production promotion requires` 拦住（四档最新决策必须全是 promote）。rollback 目标改成非直接前一版，应被 `direct previous release` 拒绝。观测 JSON 写别人的 `release_id`，canary 失败关闭而不是默默改绑。
+
 ---
 
 ## 9. 易错点与边界
@@ -428,6 +440,21 @@ Week15 接的是成本、性能和上线收官，不是回头补一个 lakeFS。
 8. Canary 决策顺序里，红线、观察窗、质量 gate 谁先谁后？质量变好但 PII 泄漏，应 promote 还是 rollback？
 9. 为什么 rollback 只允许直接前一版，还要核对 `expected_current_release_id`？跳过这两条会出什么事故？
 10. prod 指针晋升需要哪四档决策都是 `promote`？只跑了 5% 的课堂路径，为什么不能说"已经全量上线"？
+
+### 自测题参考答案
+
+先自己答完上面的题，再往下对。
+
+1. 分别发版时，总有一段时间 data 新、index 旧，或 Prompt 新、模型旧——半套新半套旧就是半发布窗口。指针模型消掉它的办法：一份 immutable manifest 一次锁死 6 类对象，环境只改一行 `release_environment_pointer`；服务只认当前指针那一代的全部组件 ID。回滚也是改指针，不重部署、不删证据。
+2. lakeFS 管湖层分支（跨表跨格式的 Git-like 隔离），Iceberg 管表快照；二者并存，不是二选一。本仓库 **没有 lakeFS 集群**，只有策略文件 + 发布指针。生产 data 组件必须是 tag（`refs/tags/data-*`），禁止把 branch ref 写进 prod——branch 还会继续变，tag 才是不可变锚点。
+3. 讲义 Hybrid 是 `rag-v日期-序号`；仓库改成 `omni-{env}-v日期-序号`，把环境写进 ID，避免跨环境拿错包、也避免「同一天多环境撞名」。生成器按 UTC 日期在输出目录递增序号，绝不要手写 UUID。
+4. 已存在的输出文件若允许覆写，manifest 就变成可变对象，digest / 签名 / 审计链全部失真。不可变意味着内容或组件变了必须新文件、新 `release_id`，靠指针切换世代，不靠覆盖昨天那份 JSON。
+5. 不传 `--previous`，报告会把六个组件都标成 changed。风险 ≥ high 要 `service_owner`，≥ critical（data / model）再加 `data_or_model_owner`。真晋升缺上一份，等于无法区分「无变化」和「全量变更」。
+6. inputs 是六个 component，唯一 output 是当前环境的 `release_id`。这是协议适配，不是 DataHub 集群，也没有 `AgentActionFacet`——所以证明不了「Agent 改了哪张票」。动作不进血缘，出事连谁改的都查不到。
+7. 应该 fail closed，不能用「暂无」填上。后者在审计里更危险：把缺失伪装成已覆盖，法务以为证据链完整。仓库口径是 Missing evidence is never synthesized；prod 缺 canary / impact / eval，`completeness.status = fail`。
+8. 顺序不能改：红线（含缺指标）→ `rollback`；样本/观察窗不够 → `hold`；阶段 gate 或 baseline_guard 失败 → `hold`；全过 → `promote`。质量变好但 PII 泄漏，应 **rollback**——红线优先于质量变好。缺红线指标视为 `missing_red_line`，同样 rollback，不当作 0。仓库比讲义更保守：质量问题先停（hold），只有合规/安全红线才自动切回。
+9. 只允许直接前一版，挡住「回滚到无关版本」；核对 `expected_current_release_id`（代码里 `current` 必须等于此刻 pointer），挡住两个值班同时切。跳过这两条会切到错误世代、双写指针、审计链断裂，5 秒回到昨天变成「回到某个不知道的组合」。
+10. prod 升稳定指针之前，5% / 25% / 50% / 100% 的**最新**决策必须全是 `promote`。课堂只跑 5% 只证明决策引擎和指针能切，流量分发（Argo Rollouts / OpenFeature）不在 Student Core；缺档、乱序、hold、绑错 digest 都会拦住。不能把「5% fixture promote 了」说成已经全量上线。
 
 ---
 

@@ -453,6 +453,24 @@ $DEV pytest tests/contract/test_week4_iceberg_schema_contract.py \
 - 把 `iceberg_schemas.py` 里某张表的 `partition_spec` 改掉再跑 `catalog --smoke`，观察表的 partition 有没有变化——你会发现完全没变，因为建表时根本没传 partition spec。这是理解"schema 文件不等于落地状态"最快的方式。
 - 故意把 `ICEBERG_S3_ENDPOINT` 改成 `http://localhost:9000` 再跑 smoke，体会"本机能跑、容器里失败"这类问题。
 
+### 动手清单参考答案
+
+先自己答完上面的验收问题和加分练习，再往下对。
+
+1. Warehouse 根是 `s3://omni-lakehouse/warehouse`；四张表 location 是 `{warehouse}/{namespace}.db/{table}`，即 `.../bronze.db/raw_ticket_event`、`.../bronze.db/raw_doc_asset`、`.../silver.db/ticket_fact`、`.../silver.db/knowledge_doc`。Catalog 命名空间是 `bronze` / `silver`（PostgreSQL SQL Catalog 只存表指针，Parquet 在 MinIO）。
+2. 真写走 `table.overwrite`，`operation` 应是 overwrite / replace 一类，不是 append。`snapshot_id` 在 `reports/week04/materialization_report.json` 里；源表为空会 `snapshot_id: null`（只 ensure 不提交）。要有可对比的历史，第 3 步需跑两遍。
+3. 用 `--view files` 看当前 snapshot 的 data file 数和 `record_count`。对不上优先查 Bronze ticket 的 `DISTINCT ON (source_id, source_fingerprint)`（去重会少于源行），其次才是空源跳过写入。不要假设「写入成功 = 行数相等」。
+4. 默认 `omni.data_release_id=week04-dev-local`（可用 `WEEK04_DATA_RELEASE_ID` 覆盖），和 `omni.ingest_batch_id` / `omni.week` / `omni.write_mode` 一起写进 snapshot property。Week11 评测要绑的是这个数据状态，不是「当时代码能跑」。
+5. demo 默认拿**最旧** snapshot 对比当前。两次 materialize 之间源库没变，行数差可以是 0；有变，差值应能用源表变化解释。对不上就先查是不是看错了 snapshot（不是「上一版」除非手动传 `--snapshot-id`）。
+6. add-column 后 `latest_schema_id` 应增加。演进是 metadata change，不重写旧 Parquet；旧 snapshot 读新列一般是 null。这只证明「能回看旧状态 + 新字段有版本」，不是随便 rename/drop。
+7. smoke 数据量小，`file_count` 往往偏多、`avg_file_size` 偏小。本周正确动作是记进 baseline，**不做 compaction**：没有基线的清理看起来像维护成功，实际缩短可回看历史。compaction / expire 是后续维护，且要先有保留策略。
+
+加分练习：
+- 只跑 `catalog --smoke` 再 inspect：表在、snapshots 空。这就是「表存在 ≠ 有状态证据」——ensure 不等于提交。
+- 跑两次 materialize 后，`--view history` 应看到两次 `made_current_at`；用第一次的 `snapshot_id` 做 time travel，旧行数仍在。说明 overwrite 仍留 snapshot 链，不是物理删表。
+- 改 `iceberg_schemas.py` 的 `partition_spec` 再 `--smoke`：已存在的表 **partition 不变**。建表调用没传 spec，schema 文件里的分区只是概念。看完改动应还原，避免本地 schema 和笔记不一致。
+- 容器里把 endpoint 写成 `localhost:9000`：本机进程也许能打到 MinIO，devbox 里会连错。这只说明配置要走服务名 `minio`，改完记得改回 `.env.local`。
+
 ---
 
 ## 9. 易错点与边界
@@ -498,6 +516,23 @@ README 的 "Week04 Lakehouse 最小闭环" 一节把边界写死了，`lakehouse
 10. `--plan` 和 `--dry-run` 有什么区别？想在完全不碰 catalog 的情况下核对源行数，该用哪个？
 11. baseline、benchmark、tuning 的区别是什么？为什么看到 file_count 很高、avg_file_size 很小时，本周的正确动作是"记录"而不是 compaction？
 12. 团队为了省存储跑了一次 expire snapshots，当前表读起来完全正常。三周后 Week11 的评测要复现一个旧结果，会发生什么？这件事该在哪份文档里提前定好？
+
+### 自测题参考答案
+
+先自己答完上面的题，再往下对。
+
+1. 都能查当前，但只有 Iceberg 用 snapshot / history / files 留下可命名的提交。raw bucket 缺强制版本化；Postgres 默认只是当前业务视图；pgvector 是搜索目录，不是数据账本。
+2. 有 snapshot 绑定后，复盘变成：周一答「回滚到 5.7.9」对应哪版 `raw_doc_asset` snapshot，周三换硬件对应哪次索引重建消费的文档资产，分数变化发生在数据变更前还是后。没有账本就只能对着 raw / 日志猜。
+3. 读旧状态：`snapshot_id` → 该 snapshot 的 manifest list → manifest（files + 统计）→ data files。Time travel 只换读取入口，不复制整张表；代价是 snapshot 保留策略。
+4. 类比到「commit ≈ 一版表状态」为止。Iceberg 不记录代码 diff、不是开发分支；manifest 还带 file 统计；checkout 是换 snapshot 入口而不是检出另一份工作区。
+5. atomic metadata swap 让「当前表状态」一次切到新 metadata 文件，读者始终读一致 snapshot。若靠列目录当 current，并发写入会半份可见、互相覆盖，可靠读和 optimistic retry 都没有锚点。
+6. 第一版能力是 4 表能写入、出 snapshot、能回看、能验收。先铺十几张 Gold，最小闭环没站稳，最先返工的是层职责和 source mapping（字段名、时间语义、去重键），不是缺表。
+7. Bronze 过早做业务解释：出 bad case 时分不清源问题还是 transform 问题，replay 入口丢了，更难补。Silver blind append：当时看起来行数变多，查当前事实却取到旧状态、KPI 漂；有稳定 key 还能修，但已经污染过消费。
+8. Catalog 记表和 metadata 指针；Warehouse 是 metadata + data files 的存储根；Table Location 是某张表在 warehouse 里的路径。`localhost:9000` 在宿主机也许能跑，容器内必须用服务名 `minio`，否则 endpoint 连不上。
+9. Silver 是当前状态表，不能 blind append；代码四张表一律 overwrite，Silver 多版本并存那类事故被挡住。代价是讲义里的 append 时间线变弱：每次 materialize 是全量重写，增量事件史要靠 snapshot 链而不是行追加。
+10. `--plan` 不连 catalog，只读源库行数；`--dry-run` 仍会 load catalog、ensure 表，只是不写 snapshot。完全不碰 catalog 核对源行数，用 `--plan`。
+11. Baseline 记录当前状态；benchmark 测上限；tuning 改行为。file 又碎又小是小批写入的预期信号，本周只记录。没有 baseline 就 compaction，会把「现在什么样」抹掉，后面无法判断是变好还是变差。
+12. 当前表仍可读，但旧 snapshot 过期，Week11 无法 time travel 到当时那版数据，评测和 release 复盘断链。保留策略应写在 baseline / `perf_baseline_template.md`（以及 runbook 的维护边界）里，expire 之前先有记录。
 
 ---
 

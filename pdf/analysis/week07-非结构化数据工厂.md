@@ -472,6 +472,19 @@ $DEVBOX pytest tests/integration/test_week07_parse_pipeline.py \
 - 在某条 chunk 内容里塞一个邮箱地址，确认 `pii_detected=true` 且 `allowed_for_indexing` 变 false，同时整批 `quality_status` 只是 `warn`——体会"整批结论"和"单条资格"是两件事。
 - 对比 `manifest_week07_multimodal_v1.json` 里 `chunk_size: 320` 和默认 512 的产物差异，数一下 chunk 数量和 `span_start/span_end` 的变化。
 
+### 动手清单参考答案
+
+先自己答完上面的验收问题和加分练习，再往下对。
+
+1. 第 2 步（helpcenter、S3 占位）`week8_ready=false`；第 3 步先生成 fixture 再跑，应为 `true`（不再被 synthetic 挡住）。第 2 步 false 是因为 `week8_ready` 比 `quality_status==pass` 多一条：禁止任何 `source_path_missing_synthetic_fallback` chunk。占位文本可以 warn 通过，但不能 ready。
+2. 课堂几乎一定是 `pypdf_baseline`。第 2 步常见 warning 是 `idp_requires_local_path_pypdf_baseline_used`（只有 S3 路径）；第 3 步本地 PDF 则是 `idp_parser_unavailable_pypdf_baseline_used`（没装 Marker/Docling），或 `idp_text_empty_pypdf_baseline_used`。三种在 artifacts 里 backend 名字一样，**先看 warning 再看 backend**。
+3. pdf → `page`（没有 `page_no` 则 `fallback`）；image → `object`；audio / video → 有 `start_ts` 为 `timestamp`，否则 `frame`。pypdf 的 PDF `bbox` 为 null，`bbox_missing_reason` 写 `pypdf_no_bbox`——`ParserCapability.preserves_bbox=False` 一路传到 anchor。
+4. 第 2 步：synthetic fallback 的 chunk 全部 `allowed_for_indexing=false`。第 3 步：fixture 齐全时通常 0 条 false。逐条对照五个条件：`anchor_count>0`、content 非空、不是 synthetic、不是 `MEDIA_BLOCKING_REASON_CODES`、没有 `pii_detected`。
+5. `gate_decision` 映射：`pass`/`warn`/`block` ← `quality_status` 的 `pass`/`warn`/`fail`。前者是报告投影，后者是整批结论；整批 warn 时单条仍可能不许索引。
+6. 四条 `consumer_rules`：`require_evidence_anchor`、`reject_allowed_for_indexing_false`、`citations_from_evidence_anchor_only`、`respect_strategy_versions`。Week08 不许索引无锚点 / 资格为 false 的 chunk，不许 LLM 发明 citation，不许忽略 `chunk_strategy_version` / `parse_strategy_version`。
+
+加分练习：删掉 audio 的 `transcript_object_path` → 整批 `failed` 且 `chunks==[]`，宁可不产垃圾。非法 `--chunk-strategy` → `ValueError`，策略版本是白名单。chunk 里塞邮箱 → `pii_detected=true`、该条不许索引，整批只是 `warn`。`chunk_size: 320` 比默认 512 切出更多、更短的 chunk，`span_start/span_end` 间隔变小。
+
 ---
 
 ## 9. 易错点与边界
@@ -518,6 +531,23 @@ Week08 不能假设的：无 anchor 的 chunk 可索引、LLM 生成的 citation
 10. 音频没有 transcript sidecar 时，仓库为什么宁可整批 `failed` 也不产出 chunk？如果退而求其次产出"二进制解码文本"会污染下游哪几个环节？
 11. 讲义主推 Marker / LlamaParse，仓库默认却降级到 pypdf baseline。这个降级在数据里留下了哪些痕迹？Week08 怎么知道自己拿到的是低保真证据？
 12. `chunk_id` 用 `source_fingerprint + section_id + section_chunk_index + chunk_strategy_version` 哈希生成，而不是自增 ID。这个设计对"换切片策略"这件事意味着什么？
+
+### 自测题参考答案
+
+先自己答完上面的题，再往下对。
+
+1. 多栏财报当字符串会跨栏串行，数字串到隔壁表。模型再强也是在错误结构上推理——这是 Parse 没保 layout，不是模型能力问题。
+2. 类型识别决定工具路由，Load 阶段错了后面全错。`text_based`（coverage > 0.8）走 Marker / Docling / LlamaParse；`scanned`（< 0.2）走 OCR；`hybrid` 文本抽取 + OCR 双管 fallback。
+3. Late Chunking 改的是 **embed 顺序**（先整段再按边界池化）；Contextual Retrieval 改的是 **chunk 内容**（加一句上下文前缀）。OpenAI embedding 不提供 token-level 向量，所以用不了 Late Chunking。
+4. 按行切会切断函数语义。超过 max_size 就拆方法；无论怎么切都要保住 imports 和类上下文当 anchor，否则 chunk 无法解析符号。
+5. L2 是页码 + section 标题（段落级）；L3 是页码 + bbox + 段落引用（坐标级）。To B 要前端高亮原文，没有 bbox 做不到，所以生产及格线是 L3。
+6. 「传了不对齐」是假证据：cite 第 1 个实际看第 3 个，比没证据更危险。Index 这步团队常为 ANN 性能砍掉业务 metadata，上线后追溯只能空白。
+7. 纯随机 100 sample 漏检率约 25%。70% 分层保覆盖代表性，20% 困难打历史 bad case / 复杂 layout，10% 对抗验极长极短和复杂表。
+8. 整批可以因 fallback / synthetic / PII 警告而 `warn`，单条仍可能 `allowed_for_indexing=false`：synthetic fallback、`pii_detected`、`MEDIA_BLOCKING_REASON_CODES`、空 content、`anchor_count=0`。
+9. 占位文本可以 warn 通过，但不能当 Week08 起跑线。不排除的话，索引会吃进假 chunk，citation 指向不存在的原文。
+10. 没有 transcript 还解码二进制，会把乱码当 chunk 送进索引、检索、生成。仓库宁可整批 `failed` 且 `chunks==[]`。污染的是 Week08 的向量库和 citation。
+11. 痕迹：`parser_backend=pypdf_baseline`、`fallback_used=True`、三条 warning 之一、`preserves_bbox=False`、`bbox_missing_reason=pypdf_no_bbox`。Week08 靠 `parser_capability` 判断这条证据不能当 Docling 级坐标用。
+12. 换 `chunk_strategy_version` → 所有 `chunk_id` 全变 → Week08 必须用新的 `index_release_id` 重建索引。这是讲义「用 content hash 当主键」的仓库版，不是自增号能原地改策略。
 
 ---
 

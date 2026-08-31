@@ -458,6 +458,23 @@ $DC pytest tests/integration/test_ingest_state.py \
 - 手动把 `week03_ingest_state.json` 的 `last_processed_cursor` 改成未来时间，再跑 replay plan，看 plan 是否还成立——这是"state 先于事实前进"的手工复现。
 - 照 L03 骨架把迟到/重复/乱序决策表写成 `docs/blueprints/week03/late_arrival_decision_table.csv`（仓库缺这一份），每行必须有 `reason_code`。
 
+### 动手清单参考答案
+
+先自己答完上面的验收问题和加分练习，再往下对。
+
+1. smoke fixture 两条都合法时，dry-run 预期 `total=2`、`valid=2`、`invalid=0`、`inserted=0`、`skipped=2`、`errors=0`（dry-run 不写库，合法行记 skipped）。三个差值：`total−valid=invalid`（合同外）；`valid−inserted` 在 dry-run 里是「没落盘」，真实写入里才拆成 inserted / skipped；`errors` 是执行失败，不是非法记录。Reconcile 要的是缺口可解释，不是数字好看。
+2. 第二次真实写入，Bronze 唯一键 `(source_id, source_fingerprint)` 冲突走 `ON CONFLICT DO NOTHING`，所以 `bronze_inserted=0`、`bronze_duplicates` 等于第一次的 `bronze_inserted`。Silver 仍 `DO UPDATE`，`silver_upserted` 还会加：当前事实被刷新，来源事件不再多一行。
+3. `last_processed_cursor` 来自 `updated_at or created_at`（字符串取最大）。这一批只要有 `invalid` 或 `errors`，checkpoint **不写**（`checkpoint_skipped_reason=ingest_not_clean`）；dry-run 也完全不写。这样 state 不会在事实写完之前前进，避免「读一半失败 → 水位已推 → 缺口被固化」。
+4. `--mode replay` 的 plan 是：锁定 source → 先看 checkpoint → 按已有 `batch_id` / `last_success_batch_id` 重放已知批次 → 先写 recovery report 再碰存储。`checkpoint_snapshot` 从 `data/canonization/checkpoints/week03_ingest_state.json` 读（`ingest_state.py` 的 `DEFAULT_STATE_PATH`），不是 runbook 里写的 `data/state/`。
+5. 缺 `--start-cursor` / `--end-cursor` 时，plan 仍会出「先构造历史窗口」几步，但 `warnings` 会出现 `Backfill mode expects both start_cursor and end_cursor.`，`status` 变成 `warning`（有 warning 就不是 `ok`）。说明 backfill 没有边界就不能当真执行。
+6. Dagster 里 `seed_manifests` 主要挂 `manifest_count` / `manifest_ids`；`raw_ticket_events` 主要挂 `event_source_count`。这是资产化入口的 count 级 metadata，**不是** `ticket_ingest.py` 那份带六个数和 checkpoint 的 report。两条路并行：asset 目前不写 DB（仍有 `TODO(Week03)`），真实写入走 CLI。
+7. `manifest_id` 在 seed_loader 报告的 `results[].manifest_id` 和 Dagster `manifest_ids`；`batch_id` 在 CLI 参数、两份 smoke report、checkpoint 的 `last_success_batch_id`；`run_id` 在 seed_loader 是 `seed-loader::{batch_id}`，ticket_ingest 是 `ticket-ingest::{batch_id}`；`source_fingerprint` 落在 Bronze 行上（payload SHA256），不在 Dagster metadata 里。不要去找不存在的 `reports/week03/*.md`。
+
+加分练习：
+- 只改 `subject` 一个字符后再写入：Bronze 会**多一行**。说明幂等键是整条 JSON 的 fingerprint，任何字节变化都算新事件——这是「保留来源证据」和「严格去重」的代价，不是让你去改生产库。
+- 把 `last_processed_cursor` 改到未来再出 replay plan：plan 仍会引用这份超前 state，等于把还没发生的窗口当成已处理。看完后把 state 文件恢复；这只用来理解 Gap，不要带着脏 state 做真实写入。
+- 补 `docs/blueprints/week03/late_arrival_decision_table.csv` 后，每行应能看到 `case / condition / action / evidence / reason_code`。没有 `reason_code` 的动作后面无法回放，表格才算落地讲义那张决策表。
+
 ---
 
 ## 9. 易错点与边界
@@ -496,6 +513,23 @@ Week03 交付的**不是完整采集平台，而是一组最低运行时承诺**
 10. 为什么 backfill 的主语必须是 asset + partition？没有 partition 思维，backfill 会退化成什么？
 11. `restore` 和 `replay` 的区别是什么？什么信号出现时你必须先 restore？
 12. 恢复决策文档里"为什么不是另外几个动作"这一项为什么不能省？它防的是什么？
+
+### 自测题参考答案
+
+先自己答完上面的题，再往下对。
+
+1. 五个条件：输入边界明确、执行可重复、状态可持久化、结果可解释、恢复有路径。若只能保一条，保「结果可解释」（run evidence / report）——没有它，其余四条坏了你也不知道，恢复只能猜。
+2. Gap 不报错：读一半失败 → checkpoint 仍被更新 → 下次从新位置继续 → 缺口被固化。仓库里 `ticket_ingest.py` 只在 `errors==0 and invalid==0` 时写 checkpoint，dry-run 完全不写，就是防「state 先于事实前进」。
+3. 幂等保护**写入副作用**，去重判断**输入**是否同一事件。本项目 dedupe / Bronze 幂等键是 `(source_id, source_fingerprint)`（payload SHA256，不是 `event_id`）；Silver 的对象键是 `ticket_id` upsert。写入层幂等不能替代输入层去重。
+4. Bronze 要保留来源证据，重复到达 `DO NOTHING`；Silver 要当前事实，所以 `DO UPDATE`。Bronze 也改成 upsert，会覆盖历史事件，bad case 时分不清是源数据问题还是后来被改掉的。
+5. 「Bronze 有、Silver 缺」是部分提交：执行层写崩或事务不完整。优先 **rerun** 同一 job（依赖幂等把缺口补上）；只有怀疑输入批次本身，才 replay。先定位再选动作。
+6. 挑三个即可：被回写（cursor 乱跳）、数据变了但 `updated_at` 没变（漏数）、语义漂成 ETL 时间（窗口不再表示业务变化）。来源能保证单调序列时，宁可用 `sequence_id`，少吃迟到和回写。
+7. CDC / slot 崩溃后会重发，exactly-once 在真实 crash 里站不住。at-least-once 防漏；幂等防重复写入副作用；dedupe 防同一输入当两件事；可回放让缺口能 bounded 恢复。
+8. 是 documented behavior，不是 bug。客户端必须自己做 dedupe + 幂等写入，不能把 slot 位置当成「不重不漏」。
+9. manifest 回答这次想接什么；asset 回答实际产生了什么持久化结果；job 只是触发 materialization；asset check 回答资产是否健康。把脚本名当资产名，下游会绑到一次执行而不是可消费对象，重跑/补数都会找错主语。
+10. 主语必须是 asset + partition，这样 backfill 只补缺失或重算旧窗口。没有 partition 思维，backfill 会退化成「重跑全链路」。
+11. replay 是同一批输入重放；restore 是回到已知可用快照。state / sink / 下游表已被污染时必须先 restore——再 replay 只会把脏状态扩得更大。
+12. 逼你写清排除理由，防止「动作越大越安全」和层选错（执行级问题却做历史 backfill）。缺这一项，runbook 就变成命令菜单而不是锚点驱动的判断。
 
 ---
 

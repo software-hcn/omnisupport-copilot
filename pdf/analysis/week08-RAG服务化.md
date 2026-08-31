@@ -456,6 +456,20 @@ curl -X POST http://localhost:8000/rag/answer \
 - 用一个输出维度不是 1536 的 embedding provider 跑索引，确认它被**拒绝**并在报告里写了 dimension mismatch，而不是静默截断。
 - 追一下第 6 条代码细节里 confidence 的算术：算出 RRF 分数量级，解释为什么关掉 rerank 后请求容易 abstain。
 
+### 动手清单参考答案
+
+先自己答完上面的验收问题和加分练习，再往下对。
+
+本周动手清单 curl 的是产品契约 `POST /rag/answer`（四个 header 必需）。课堂短链路是 `POST /api/v1/query`，两条共用 `retrieval.py` / `generator.py`，**不要写反**：Week01 的 `/api/v1/query` 不是本周这条验收 curl，`/rag/answer` 也不是 Week01 的 classroom query。
+
+1. `include_debug=true` 时同一 chunk 四路分：`vector_score` 来自 dense，`fts_score` 来自 PostgreSQL FTS，`rrf_score` 是排名融合（量级约 0.01–0.03），`rerank_score` 是 cross-encoder。哪一路捞上来看谁非空、谁先进入 merged。带错误码的 query 往往只有 `fts_score`。
+2. 模型加载成功 → `retrieval_debug.mode=hybrid_rrf_rerank` 且 `rerank_fallback=false`；`sentence-transformers` 不可用或模型名无效 → `hybrid_rrf` 且 `rerank_fallback=true`，**不报 500**。课堂环境常见后者。
+3. `query_rewrite_debug.mode` 四选一：`disabled` / `deterministic` / `llm` / `fallback`。没密钥或熔断时走 `fallback`，`fallback_reason` 会写 LLM 不可用 / 超时 / 熔断开路。`disabled` 就是紧急回滚开关。
+4. 每条 citation 的 `page_no` / `section_path` / `doc_version` 来自 Week07 evidence metadata，由 `/rag/answer` 的 `_citation_from_chunk()` 从检索结果构造，prompt 写死「不许发明 URL、页码、doc_version」。LLM 看不到编造通道。
+5. `no_retrieval_results` = 召回空，去查索引 / filter / 改写；`low_retrieval_confidence` = 有候选但 `confidence < retrieval_min_score`（默认 0.6），去查 rerank 是否 fallback、以及 RRF 量级能不能当置信度。索引报告的 `quality_gate` 是建索引门禁（pass/warn/fail），和单次请求的 abstain 不是同一层。
+
+加分练习：`EG-BOOT-004` 这类错误码，纯向量会丢掉、FTS 能捞到、Hybrid+RRF 能排上。卸掉 cross-encoder 后 `/rag/answer` 回退 RRF 且 `rerank_fallback=true`。三种 `query_rewrite_strategy` 会改变 `semantic_query_sha256` 和向量路召回，lexical 路仍贴原词。非 1536 维 embedding 被整批拒绝并记 dimension mismatch。RRF 两路都命中 top-1 约 `1/61×2≈0.033`，过不了 0.6，关掉 rerank 后请求容易 `low_retrieval_confidence` abstain。
+
 ---
 
 ## 9. 易错点与边界
@@ -499,6 +513,23 @@ Week08 交付的是**生产 RAG 的最小可用控制面**：可版本化索引�
 10. release_id 绑定的四件套里，如果只做到了「索引 + prompt」两件，事故排查会在哪一步卡住？
 11. Canary 的三个自动阈值（faithfulness -3% / P95 +20% / cost +30%）中，为什么 cost 只告警不回滚？
 12. Bad case 库的四类标签，为什么比「答错了」一个标签有价值？Week08 的 smoke eval 和 Week11 的完整 eval 差别又在哪？
+
+### 自测题参考答案
+
+先自己答完上面的题，再往下对。
+
+1. 订单号是字符精确匹配。Dense 的短板是专有名词 / 编号：语义近邻全是「退款/流程」，正确订单进不了 top-50。不是模型笨，是向量干不过 BM25/FTS。
+2. Cosine 是 0–1，BM25 可以 50+，尺度不可比；**排名是天然归一化**。换成 `0.7×cosine + 0.3×BM25` 要先归一化（选错就翻车），α/β 还得每个数据集重调。`k` 改成 6 会放大 rank 差，改成 600 各路贡献趋于平坦，30–100 之间影响很小。
+3. HyDE 适合垂直专业、query 短而模糊（先假想文档再 embed）。短事实 query 上了会更差：LLM 假想答案误导性强。判断依据是 query 类型，不是「垂直领域就上」。
+4. 10 亿 doc 且 P95 < 200ms 选 **ColBERT**（token 向量可预存，在线 50–150ms）。Cross-Encoder 是 O(N) 太慢；LLM-as-Rerank 1–3s 更不可能。
+5. 不矛盾。rerank 把 50 砍到 5，context 短了生成更快，总延迟下降。加一阶筛的是噪声，不是在更长的 prompt 上再跑一轮。
+6. citation 必须由 retrieval metadata 生成，prompt 求 LLM 给来源就是给幻觉留后门。合法但错的场景：模型输出「手册 p12」且格式完全合规，实际命中的是 p3 另一段。
+7. 三路分离：semantic 只进向量、lexical 只进 FTS、rerank 贴用户原词。全用改写后的 semantic，会丢掉错误码 / 型号的精确匹配，最终排序也偏离原意。
+8. `no_retrieval_results` → 改索引 / Hybrid / Query Rewrite / filters。`low_retrieval_confidence` → 看 0.6 阈值、rerank 是否 fallback、以及有没有把 RRF 量级误当置信度。
+9. 检索结果每次都变，缓存无意义还污染前缀，会把旧证据当成新 query 的命中。只缓存稳定的 system prompt + skills。
+10. 四件套是索引 / Prompt / 模型 / Eval。只绑索引 + prompt，事故时分不清是换了模型还是 eval 口径变了，只能猜。
+11. cost +30% 可能是合理换了更强模型；Faithfulness -3% 和 P95 +20% 直接伤用户，必须立刻回滚。cost 只告警，让人审，不自动切指针。
+12. 四类标签指向四个修法：`retrieval_miss` 修 Hybrid/改写，`rerank_wrong` 调 reranker，`hallucination` 加 Citations/Schema，`knowledge_gap` 补数据或 fallback。Week08 smoke 只有 6 个 case 护契约形状；Week11 才是 200+ golden + LLM-as-Judge / Ragas。
 
 ---
 

@@ -450,6 +450,24 @@ $DC pytest tests/contract/test_week05_metric_contracts.py \
 - 往 registry 里加一个新 ratio 指标（例如 `reopen_rate`），故意不加 `numerator`/`denominator`，确认 validator 报错；再故意不同步 safe view 白名单，确认 `accepted_values` test 或 validator 拦住它——**这才是"registry stale"反模式的手感**
 - 改 safe view 加一列，数一数需要同步修改的地方到底有几处（见第 6 节细节 4）
 
+### 动手清单参考答案
+
+先自己答完上面的验收问题和加分练习，再往下对。
+
+1. `reports/week05/dbt_build_evidence.md` 记的是 **39/39** 通过。这是 `tag:week05` 下模型 + 测试的合计。失败时先看是 model 还是 test：模型失败先修 SQL，测试失败修业务逻辑，不要 disable test、也不要只 patch 测试。
+2. `support_kpi_mart` 一行是 **某指标 × 某日期 × 某维度组合**。`agent_tool_input_view` 不暴露 `ticket_id` / `customer_id` / subject / comment 正文，只留白名单 `metric_name` 和安全维度；同时又比讲义「瘦视图」多了分子分母类支撑列，供跨维度重算。少列是 PII/越权边界，多列是为了不把预聚合 rate 再平均一遍。
+3. 预期 `metric_count=11`、`experimental_metric_count=1`（`first_resolution_rate`）。validator 核对：registry 必填字段、`source_model` / `safe_view` 文件存在、维度和过滤在 safe view 列集合内、v1.1 元数据、ratio 必须有 `numerator`/`denominator`、`quality_tests` 非空、角色是 registry 子集、指标名在白名单。
+4. 正例 `policy_applied` 至少有 `tool_contract`、`metric_registry`、`safe_view`、`parameterized_sql`，成功查询还会加 `semantic_aggregation`（以及 tenant / org / experimental ack 视请求而定）。`data_freshness`：`generated_at_max` 来自结果行；`release_id` 来自行内 `data_release_id` 或服务 `release_id`；`registry_id` / `registry_version` 来自 registry。
+5. `bad_metric` → `METRIC_DENIED`；`bad_role` → `ROLE_DENIED`；`bad_experimental` → `EXPERIMENTAL_METRIC_NOT_ACKNOWLEDGED`；`bad_org_scope` → `ORG_SCOPE_REQUIRED`。全部在 `kpi_query.py` 的 `_validate_request()`：schema → role → metric → experimental → dimension → filter → org scope → 窗口。
+6. 能。`audit` 含 Who（`actor_id` / `actor_role` / `trace_id` / `purpose`）、What（metrics / dimensions / filters / 日期）、Registry（`registry_id` / version / `safe_view`）、Data（`release_id`）、Outcome（`row_count` / `query_fingerprint`）、Policy（`policy_applied`）。缺其中一块，出事后无法回答「谁在哪一版口径下查了什么」。
+
+加分练习：
+- 补字段 description 后，用第一性问题自检：消费者应能看出 `metric_date` 来自 `created_date` 而不是 `updated_at`。这是 docs 闸，不是改数。
+- 给 `ticket_fact` 配 freshness 再跑 `dbt source freshness`：预期 `analytics/target/sources.json` 开始有内容。现在 `sources.yml` 没有 `loaded_at_field`，所以跑了也是空的——用来理解「仓库缺这一层」。
+- 按讲义模板写 impact note：改 `first_response_minutes` 会碰到 `avg_first_response_minutes`、KPI mart、safe view、registry、工具契约和后续 eval。列五类下游即可，不必真改生产口径。
+- 新 ratio 不加分子分母：validator 应报 `ratio metric must declare numerator and denominator`。不同步白名单：`accepted_values` 或 validator 的 `SAFE_VIEW_METRICS` 会拦住。这是「registry stale」的手感，加完应删掉练习条目。
+- 改 safe view 加一列，至少要数到 **三处**：视图 SQL、`kpi_query.py` 的 `SAFE_COLUMNS`、`validate_metric_registry.py` 的 `SAFE_VIEW_COLUMNS`。漏一处就是讲义说的三处镜像漂移。
+
 ---
 
 ## 9. 易错点与边界
@@ -492,6 +510,23 @@ Week05 交付的是**一份可负责的指标包 v1**：dbt models + tests/docs/
 10. 九种 denial_code 里，哪几种是"registry 语义问题"、哪几种是"权限与成本问题"？为什么要给 LLM 返回码而不只是报错？
 11. 为什么跨维度聚合时不能直接对 `sla_breach_rate` 求平均？registry 的 `numerator` / `denominator` / `weight_column` 在 runtime 里如何被用到？
 12. `actor_role` / `tenant_id` 由服务端覆写，`actor_org_ids` 却仍来自 payload——这个差异说明了什么？给 safe view 加一列时，又需要同步修改哪几处？
+
+### 自测题参考答案
+
+先自己答完上面的题，再往下对。
+
+1. 根因是时间字段、grain、filters 从未约定，不是三条 SQL 写错。三个都能跑更危险：看起来都合法，Agent 会高自信地用错口径。映射：metric 层有了名字（「P1 工单数」）；business definition 层缺统一口径；engineering interface 层缺 registry / 工具，所以 BI 和 Agent 对不齐。
+2. staging 是最深、被所有 mart 依赖的一层；在这里 `group by` 等于把错误 grain 写进地基，上面怎么测都会「看起来对」。分界：派生布尔（`is_p1` / `is_open`）可以在 staging；聚合 KPI 只能在 intermediate / marts。
+3. `support_case_mart`：一个 support case。`support_kpi_mart`：metric × date × 维度。`agent_tool_input_view`：白名单指标的安全行。safe view 必须是 view，才能跟上 mart 最新构建；做成 table 会有两份数据、Agent 可能读到旧口径。
+4. 长表让新增指标变成多一行 `values`，白名单、测试、registry 都按 `metric_name` 扩展。用宽表则要加列、改 mart schema、改测试、改 safe view、改 registry 和工具契约，一次口径变更变成表结构变更。
+5. build pass 只证明能跑。七道闸：build → tests → docs → lineage → registry → safe view → audit fields。docs / lineage 是「文档类」，但答不出字段含义和影响范围就不能签——HOLD 一个指标比修一次事故便宜。
+6. `not_null` 堆再多也拦不住 reopen 算不算、rate 是否越界。三个自定义测试：`no_pii_columns_in_agent_tool_input_view` 守 PII 列；`ratio_metrics_between_0_and_1` 守三个 rate 区间；`metric_values_non_negative` 守 count/avg 非负。
+7. 它是「已解决且未升级 / 已解决」的代理口径，真实 reopen 事件还没接上。runtime 用 `include_experimental_metrics=true` 才放行，否则 `EXPERIMENTAL_METRIC_NOT_ACKNOWLEDGED`，避免被静默当生产指标。
+8. 问题在组织：`metric_name` / grain 没立住，买 SaaS 也只是定义一堆没人用的指标。准备好的信号：五个核心字段稳定（`metric_name` / grain / `allowed_dimensions` / `allowed_filters` / `allowed_roles` + `max_window_days`），且 BI / Agent / Eval 能共用同一份 registry。
+9. strict 保证形状（`raw_sql` 进不来、`additionalProperties: false`），保证不了指标存在、角色能否查、窗口是否过大。例：JSON 合法但 metric 未注册；窗口超过 `max_window_days`；实验指标未 ack。
+10. 语义类：`METRIC_DENIED` / `DIMENSION_DENIED` / `FILTER_DENIED` / `EXPERIMENTAL_METRIC_NOT_ACKNOWLEDGED`。权限与成本：`ROLE_DENIED` / `WINDOW_TOO_LARGE` / `ORG_SCOPE_REQUIRED`。返回码是给 LLM 的修正指令，不只是报错。
+11. 预聚合 rate 再 avg 会得到「平均的平均」，分母权重丢失。runtime 按 registry 的 `numerator`/`denominator` 做 `sum/sum`，或按 `weight_column` 加权；这就是 `semantic_aggregation`，也是 ratio 必须声明分子分母的原因。
+12. 说明「哪些字段可以信客户端」：身份和租户必须服务端派生；`actor_org_ids` 是课堂妥协，生产应同样服务端出。给 safe view 加列至少同步三处：`agent_tool_input_view.sql`、`SAFE_COLUMNS`、`SAFE_VIEW_COLUMNS`。
 
 ---
 

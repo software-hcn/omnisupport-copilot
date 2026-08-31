@@ -401,6 +401,18 @@ curl http://localhost:8001/api/v1/tool-contracts/exports/mcp
 - 用同一 `idempotency_key` 换 `reason` 再调，确认拿到 `IDEMPOTENCY_CONFLICT`，而不是第二次成功。
 - 对比 `copilot.py` 与 `tickets.py`：连点两笔未审批退款，课堂路径会不会造出两张 approval。
 
+### 动手清单参考答案
+
+先自己答完上面的验收问题和加分练习，再往下对。
+
+1. `ticket_update` 是写类工具，决定调不调的是运行时的模型，不是编译期 if-else，所以必须四证齐全才能上线：**Schema**（`input_schema` / `output_schema`，enum、required、`additionalProperties: false`）、**幂等**（`idempotent` + 必填 `idempotency_key`）、**权限**（`allowed_roles`）、**审计**（`audit_fields` + lineage）。财务/外部写另外被 `hitl_conditions` 卡住；`risk_level` 由规则层给出，不交给 LLM。少一项，契约测试直接打回。
+2. 同 key + 同参数指纹 = 同一次动作，第二次回缓存，status 是 `cached`，不执行。同 key 但参数改了（指纹变了）是冲突：抛 `IdempotencyConflict` / `IDEMPOTENCY_CONFLICT`，拒绝执行，不是「再写一次」。
+3. 第一次 `refund_payment` 返回 `awaiting_approval`。HITL 是执行前硬门，审批完成前 `executor` **没有**被调用。
+4. 课堂 fallback demo 是 `primary_vector_search` 超时 → `lexical_cache`（`FallbackChain` 的 named step）。HITL 不在这条链上。降级结果仍必须带 `evidence_anchor`，禁止模型临场编「据我所知」。
+5. 有。`end_user` 调 `ticket_update` 返回 `denied` / `PERMISSION_DENIED`，但仍写一条 `status=denied` 的 lineage。少这一条，审计无法证明「系统拒绝过」——拒了会变成没发生过。
+
+加分练习：删掉某条 `require_approval` 后契约测试失败，这是**漏审**被门禁抓住，不是测试过严——财务类必须强制 HITL。同 key 换 `reason` 应拿到 `IDEMPOTENCY_CONFLICT`。`ControlledAgent.invoke` 是 HITL 在幂等前，连点两笔未审批退款会造**两张** approval；`tickets.py` 先查 `tool_idempotency`，第一次 `awaiting_approval` 就会 `remember`，重放同 key 直接回缓存。学控制面用 `copilot.py`，学生产语义用 `tickets.py`。
+
 ---
 
 ## 9. 易错点与边界
@@ -443,6 +455,23 @@ Week11 起才把「办得对」变成可量化门禁（评测 / Golden Set / 回
 10. `ControlledAgent` 对未审批退款不走幂等、`tickets.py` 会缓存 `awaiting_approval`，这两种选择各自防什么、各自引入什么重复提交风险？
 11. 为什么 RAG 必须包成工具，而不是 Agent 里另写一套检索调用？输出少了 `evidence_anchor` 会破坏 Week08 的哪条承诺？
 12. Week10 交付的是「能办事的 Copilot」还是「控制面」？如果有人要在本周接真实退款 API，你用蓝图的哪句话拦住？
+
+### 自测题参考答案
+
+先自己答完上面的题，再往下对。
+
+1. function 的护栏在编译期，Agent 调不调、调哪个是运行时的概率决策，单测过了挡不住模型把查询调成删除。四证必须搬到运行时；专门挡「不该发生的破坏性调用 / 越权写入」的是 **权限**（`allowed_roles` 调用前校验）。Schema 挡非法参数形状和 operation enum，幂等挡重复执行，审计让拒绝也可追。
+2. 没有幂等键：前端重发三次就执行三次，重复退款。有 key 但改了一个零：同 key 不同参数指纹，系统应**拒绝**（冲突），不能缓存——缓存会把第二次的错误金额当成第一次的成功结果。
+3. 工具过 5 个还自由选，典型事故是查询调成写入、失败陷入无限重试、多步编排漏一步还查不出来。工单状态更新用 **规则 + LLM（带 confirm）**；退款 / 资金用 **显式 Workflow + HITL**。该写死的别交给模型。
+4. 讲义 5 级把 HITL 放在 cache 之后，当成主路失败后的降级。仓库里两类失败时机不同：`FallbackChain` 只处理执行期失败（超时 / 备用 / graceful）；HITL 是执行前的策略硬门，命中就停，不进降级链。混在一起会把「不该执行」做成「执行失败后再转人工」。
+5. 让模型自觉送审，漏审一次就是不可逆资金损失。漏审比误送审更不可接受——误送审是多一次审批，漏审是钱出去了。`HITLPolicy` 多条件命中时按 `reject` > `require_approval` > `pause_and_notify` 取更严的。规则的事交给规则。
+6. UI 弹窗缺异步、checkpoint、SLA（超时降级）、三段 audit，上线后两个死法：Agent 挂死，或被悄悄绕过。Checkpoint 冻结现场并释放会话资源；Resume 等回调后再继续，Agent 绝不能在等审批时挂死。
+7. 数据血缘答「这表/文件怎么来的」；调用链答「这次请求花在哪」；动作血缘答「AI 为什么按那个按钮」。只用 OTel span、不绑 `data_snapshot_id`，投诉退款额算错时你能看见调用耗时，重放不了当时那份数据世界——五元少一维就不是 100% 可重放。
+8. 少 `prompt_release_id`：复盘卡在「当时用的哪版行为约束」，无法对比 Prompt as Code。少 `evidence_ids`：卡在「引用了哪条证据」，不知道决策依据来自哪篇文档。两者分别对应 Week08 的工艺版本和证据锚点。
+9. Happy 证明低风险自动执行 + 二次命中幂等缓存；Fallback 证明主检索失败能降到 cache 且仍带 evidence；HITL 证明退款先 `awaiting_approval`、审批后才执行。只跑 Happy 上线，最可能在超时无降级和金融未送审上裸奔——出事的永远不是 happy path。仓库课堂包只自动化了这三条（没有 Composite / Replay）。
+10. `ControlledAgent` 先 HITL 再幂等：防的是未审批就执行；引入的风险是同 key 连点造出两张审批单，两张都批可能双花。`tickets.py` 先查 `tool_idempotency` 再 HITL：防的是重复提交双审批 / 双执行，第一次 `awaiting_approval` 就会 `remember`；学控制面用前者，学生产语义用后者（蓝图也写「先幂等后 HITL」）。
+11. RAG 另写一套检索，就会有两套 schema、两套 fallback、两套 audit，Week08/10 之间最常见的工程债。包成 `knowledge_search` 后 Agent 眼里只剩一种调用。输出少了 `evidence_anchor`，会破坏 Week08「答案必须带证据」和本周 Evidence Coverage = 100% 的承诺。
+12. 交付的是**控制面**，不是「能办事的完整 Copilot」。蓝图写得很硬：Week10 教的是控制面；刻意不做真实支付/退款通道。有人要本周接真实退款 API，用这句话拦——`tickets.py` 里的记账是后面周次的产品面，不要当成课堂作业要接支付网关。
 
 ---
 

@@ -447,6 +447,18 @@ docker compose --profile tools --env-file infra/env/.env.local \
 
 排障速查（runbook 原文）：`trace_not_found` 先等 batch flush、核对 `OTEL_PROJECT_NAME`；Phoenix 空先重建 `rag_api tool_api` 镜像；Collector `connection refused` 按 compose 依赖重建 Phoenix 与 Collector。
 
+### 动手清单参考答案
+
+先自己答完上面的验收问题和加分练习，再往下对。
+
+1. Live 路径要 `same_distributed_trace=true`，RAG 和 Tool 是同一个 `trace_id`。靠 `demo_flow.py` 的 W3C `traceparent` inject，不是手抄 id。单元测试过了不证明 Phoenix 接线。
+2. 能。打开 Phoenix 项目 `omnisupport-copilot`，从 `omni.demo.flow` 读到 retrieve / generate / audit / tool / HITL，指出慢/错发生在哪一个 span 名（例如 `llm.generate` vs `hitl.wait`）。截一张图不算验收。
+3. Closure 的 alerts 应包含 `copilot_availability_burn_fast`（对讲义/契约里的 FastBurn），且带 `sample_trace_ids`。`run_closure.py` 还要求窗口里**真的产出了 alert**——回归绿但告警空，整体仍是 fail。
+4. 应生成 `reports/week12/postmortems/` 和 `reports/week12/regression/`，临时集上的 `eval_gate.status` 为 pass。Closure 证明的是告警 → incident → postmortem → Week11 反例 → eval gate。
+5. **必须完全没被改。** 规范集 `evals/sets/rag_qa_golden_v2_3_0.jsonl` 字节级不变；坏样本只写到旁路目录。改黄金集会把 Week11 基线 digest 砸掉。
+
+加分：不注入 `traceparent` 分别打两个 API，会得到两个 `trace_id`——这是 runbook 里最常见的假失败。fixture 全改 OK 后 `run_closure` 因「没有 alert」而 fail，闭环验的是「侦测得到 + 修得住」。span 里塞邮箱/手机号，`safe_preview` 测例应红——PII 是 P0，不是「可观测做得全」。
+
 ---
 
 ## 9. 易错点与边界
@@ -489,6 +501,23 @@ Week12 合上的是 Week08 服务路径、Week10 受控动作、Week11 评测门
 10. `evidence_count=0` 但 retrieve hits 正常，根因应判哪一层？对应回到哪一周修？为什么不是先换向量库？
 11. 为什么把 bad case 写进规范黄金集会破坏 Week11？仓库用什么机制既回归又不变黄金集？
 12. Live 路径绿、Closure 路径没跑（或反过来），为什么还不能说 Week12 验收通过？
+
+### 自测题参考答案
+
+先自己答完上面的题，再往下对。
+
+1. Agent 一条请求 8–15 hop，日志散在不同服务、时间戳还对不齐。时间轴直接告诉你 2.4s 里 1850ms 在 `llm.generate` 还是卡在 `hitl.wait`。先 `grep` 是对点不对链；先调 prompt 是还没定位就开药。
+2. Logs 答单点发生了什么，跨服务对不上。Metrics 答趋势/容量/烧不烧，知道发烧不知哪个器官。Traces 答这一次穿了哪些 hop、慢/错在哪。缺 Traces，oncall 卡在「系统病了，猜是哪一段」。
+3. 好 span 读起来像故事，`layer.action.strategy` 才能在时间轴上定位。少 `rag.rerank.cross`：召回了但精排丢掉时你会误判成「没检索到」。少 `rag.audit.persist`：看不见运行证据有没有落盘，复盘缺最后一环。
+4. 原文进 span 是存储爆炸 + PII 出境；身份用 `omni.query.sha256` + `length`。`safe_preview` 必须显式开（`OTEL_CAPTURE_CONTENT`）、先 redact、再限长（仓库 200）。默认 false。span 不是第二份用户内容副本。
+5. Quality 是 LLM 专属（citation / abstain / bad case），传统黄金信号没有「答得对不对」；和 Overview 同屏才能发现「成本涨同时 P99 也涨」这类共变（常是 `top_k` 被调大）。只看 P99 会漏掉「大多数人已经变慢」（P50）和「在报错而不是变慢」（Error Rate）。
+6. 绝对值没有对照：电商周一本来就比周日高。DoW（今天 vs 上周同一天同时段）抓周节律突变；Release（当前 vs 上一 `release_id`）抓上线后退化。HoH 抓突发，基线抓慢退化。
+7. 高峰偶发一下、错误预算内：不该叫人。持续半小时按 14.4x 狂烧 30 天预算：P1。14.4x FastBurn 防的是「几小时烧光月度预算」；6x SlowBurn 防的是「三天烧光」的慢漏。告警看 burn rate，不看一次 `P99>2s`。
+8. PII 是零容忍、P0、计数 > 0 就电话叫醒，可用性才有 0.5% 预算可以花——不要用同一套 burn 窗口去等合规红线。P0 和 P2 都进同一个 Slack，几天后全员屏蔽，等于没有告警。分级是把有限的被打扰额度留给真事。
+9. 钻取链在「面板 → 一条 sample trace」处断开。oncall 还得另开工具重搜 `trace_id`，30 秒定位变成 30 分钟。告警最低配置必须带 `sample_trace_ids`、当前 SLI vs SLO、`top_error_types`。
+10. retrieve hits 正常但 `llm.generate` 的 `evidence_count=0`，根因是**生成层编造**（fixture `incident_bad_citation.json` 就是这一类）。回到 Week08 prompt + Schema 把引用约束住；若 hits 本身很少，才回 Week07 chunk / Week08 hybrid。**不要先换向量库**——可观测指出的是哪一层，前几周负责怎么修那一层。
+11. 黄金集 digest 锁的是文件字节，原地追加样本会改 hash、打歪 Week11 基线和 CI。仓库 `prepare_regression_assets()` 拷一份到 `reports/week12/regression/`，追加 `W12-INC-...`，规范集 `rag_qa_golden_v2_3_0.jsonl` 保持不变。变的是临时回归资产，不是课堂黄金集。
+12. 两条路径证明的不是同一件事：**Live** 证明 OTLP 真发出去、W3C 跨服务、Phoenix 能看到整棵树；**Closure** 证明告警 → 复盘 → 旁路反例 → eval gate，且不改黄金集。缺一条都不算过。单测绿 ≠ Phoenix 接线；截图绿 ≠ 回归闭环。
 
 ---
 

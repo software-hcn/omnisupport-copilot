@@ -382,6 +382,19 @@ docker compose --profile tools --env-file infra/env/.env.local \
 
 全新环境基线（runbook 口径）：240 工单 / 10 原始资产 / 91 chunk / Graph 16 entities、14 edges、2 communities。
 
+### 动手清单参考答案
+
+先自己答完上面的验收问题和加分练习，再往下对。
+
+1. `ticket_fact` 里 `northstar-demo / data-capstone-v1` 应恰好 **240** 条。bootstrap 幂等，重复跑不应翻倍——产品路径的工单基线就是这 240 条，不是讲义里的演示数字。
+2. 当前发布知识应仍是 **10** 个原始资产、**91** 个带 embedding 的 chunk；旧课程数据标到 `course-legacy`（迁移 `013`）。全新环境基线还包括 Graph 16 entities、14 edges、2 communities。对不上说明灌数、索引或租户隔离坏了。
+3. Hybrid 问答应命中 `workspace-api-webhook`，消息带 citations、五类 release id、`trace_id`、`generation_mode`。无密钥时 `generation_mode=deterministic_fallback`，仍有 evidence，不是空 500。仓库没有讲义那套 5 级降级 / 语义缓存实现，产品路径验的是这条可演示链路。
+4. Operations 的 KPI 必须拒绝 raw SQL，返回 `audit_id` 和 `semantic_aggregation` 策略——受治理的聚合，不是把仓库查询权交给坐席。
+5. `add_internal_note` 可直接 `completed`；`grant_service_credit` 是金融动作，必须 `awaiting_approval`，管理员批准后财务行才落库。没有 `evidence_ids` 时契约直接 `ValidationError`。HITL 不是 UI 提示，是表 + schema。
+6. Phoenix 里应能用页面上的 trace id 找到 `product.copilot.answer` + `rag.query`，以及 HITL wait / resume 两条独立迹——等待审批和恢复执行不能糊成一条。
+
+加分练习：不配密钥跑 E2E，确认 `generation_mode=deterministic_fallback` 且仍有 evidence；配好模型后加 `--require-llm`，fallback 会被判失败——本地演示默认走兜底不是缺陷，验收生成质量时才要求真模型。Dagster 筛 `week15_capstone` 物化 `capstone_product_release` 及上游，成功标志 `RUN_SUCCESS`。去掉 financial 动作的 `evidence_ids`，contract test 失败，这是 P0 边界在 Tool Contract 上的对应物。两个租户打同一 `idempotency_key`，锁 id 必须不同：主键是 `(tenant_id, tool_name, idempotency_key)`，跨租户幂等键隔离。
+
 ---
 
 ## 9. 易错点与边界
@@ -425,6 +438,23 @@ L01–L04 的「相近实现」来自 Week11 业务 SLO、Week12 面板/告警/�
 10. 无密钥时产品仍能演示问答，验收时却可能必须 `--require-llm`。这两种模式分别证明什么、不能证明什么？
 11. 同一 `idempotency_key` 在两个 `tenant_id` 下为什么必须是两把锁？这和讲义 L02 的哪条 P0 红线是同一类问题？
 12. 讲义 5 级降级在仓库里找不到。你用哪三条真实路径向面试官说明「系统异常时不白屏」仍然成立？
+
+### 自测题参考答案
+
+先自己答完上面的题，再往下对。
+
+1. 只看「上月 LLM 12 万」无法拆、无法归因、无法按 ROI 动手，等于传统团队只看 AWS 总账。拆账 5 类是 Embedding / 检索 / 生成 / 存储 / 缓存；归因要用的两个键是 `release_id` 和 span（再按题型范式归到查询）。单位指标是 cost / 1k queries，不是模型单价。
+2. 题型路由首先省的是钱：FAQ 走 hybrid 大约 $2.5–5 / 1k，丢进 GraphRAG Global 能到 $8–25，范式差 5 到 15 倍；顺带也保质量，因为 FAQ 上图会加噪。通常比换 mini 更划算：前两件抓手（缓存高频查询、题型路由）ROI 最高、回本往往不到一周。仓库没有讲义那套语义缓存实现，省钱主抓手就是路由，而不是再搜一个 cache 服务。
+3. `0.92` 这么高是为了防近邻误命中答错。key 去掉 `release_id`：上新版仍命中旧答案，版本指针切了缓存没失效。去掉 `tenant`：跨租户串缓存，把别人的答复当成自己的。仓库里没有 `services/cache/semantic_cache.py`；query rewrite 的字面 LRU 对不上这套 0.92 近邻缓存，别混为一谈。
+4. 重试 3 次会把已经慢/429 的上游打得更死，用户一直转圈然后 500。L1→L4 降级链按服务等级保住 P0（有回声、不泄露 PII），主动放弃边缘能力。L4 必须返回 answer（缓存命中或「已为您预约人工」）而不是 500——白屏比答得稍差更伤信任。仓库没有 5 级自动切换，真实不白屏路径见第 12 题。
+5. 错在把 embedding 当成 prompt 的函数。embedding 是 data / chunk 的产物；prompt 变了只应清答案缓存、**留 embedding**。data 变清答案；model 变连 rerank 一起清。粗暴 `FLUSHALL` 会把命中率打掉 30–50%。仓库没有按 manifest 字段的精细失效器，这是讲义约束，不是本周代码。
+6. SLO 是工程与业务的双向契约，达到即可、有错误预算；KPI 是越高越好、没有上限。预算剩余 20%（< 25%）默认冻结非关键变更；剩余 60%（> 50%）允许激进改动——预算是用来花的。没预算的 SLO 就是 KPI。
+7. 漏了质量类（Faithfulness / Citation / Refusal）和合规类（PII=0、拦截率）。对 AI 特别危险：服务 99.5% 在线、P99 也达标，仍然可以稳定幻觉、稳定泄密。仓库 Week12 yaml 把 citation 写成 0.95、cost/query 写成 $0.02，读代码以 yaml 为准。
+8. L1 第一动作是翻 Confluence、找不到就打电话找老 X；L3 告警自带 Runbook 链接 / Skill Pack，人能跑、Agent 也能跑。`symptoms` 解决的是「告警匹配哪本手册」——没有它，半夜只能全文搜索文档。仓库没有 `runbooks/index.yaml`，现有的是按周拆开的 markdown 加 burn_rate 告警里的链接。
+9. 没演练过的命令会过期、路径会搬家、权限会变，出事当场跑不通，约等于没有。Wheel 里「发现过期命令当场 PR」保的是 Runbook 的可执行性、不过期——写十份不演，不如写三份周周演。仓库无演练 runner，这是文档级要求。
+10. 无密钥 `deterministic_fallback` 证明的是工程链：证据摘要、citation、不白屏、release/trace 仍在；不能证明生成质量，也不能拿它过 Week11 评测门禁。`--require-llm` 把这条兜底判失败，证明的是真模型路径可调用。本地演示默认走 fallback 不是缺陷；两种模式不要互相冒充。
+11. 主键是 `(tenant_id, tool_name, idempotency_key)`，同一 key 在两个租户下必须是两把锁，否则 A 租户的成功回放会吞掉 B 租户的动作，或把财务调整做到别人账上。这和讲义 L02 的 P0 红线是同一类问题：不越权、不串租户、不泄露——跨租户幂等键隔离就是运行时的那条边界，不是「key 字符串碰巧相同就复用结果」。
+12. 仓库没有讲义那套 5 级降级 / 语义缓存实现，不要假装有 `degradation_level`。用三条真实路径说明不白屏仍然成立：**hybrid fallback**——Graph 无证据或运行失败回退 Hybrid，生成无密钥/异常走 `deterministic_fallback` 证据摘要，而不是 500；**HITL**——`grant_service_credit` 等金融动作必须 `awaiting_approval`，人审完再落库，复杂/高风险不硬扛；**证据不足 abstain**——缺 `evidence_ids` 的金融动作契约直接失败，图路径缺证据必须弃权，不编造 citation。天塌了也要有回声，而不是白屏。
 
 ---
 
